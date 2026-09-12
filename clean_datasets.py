@@ -2,6 +2,47 @@ import pandas as pd
 import numpy as np
 import re
 
+
+def normalize_id(series):
+    """Trim identifier values without converting missing values to the string 'nan'."""
+    return series.astype("string").str.strip()
+
+
+def parse_mixed_amount(value):
+    """Parse currency strings that use either comma or point decimal separators."""
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.number)):
+        return float(value)
+
+    cleaned = re.sub(r"[^0-9,.-]", "", str(value).strip())
+    if not cleaned:
+        return np.nan
+
+    comma = cleaned.rfind(",")
+    point = cleaned.rfind(".")
+
+    if comma >= 0 and point >= 0:
+        decimal_separator = "," if comma > point else "."
+        thousands_separator = "." if decimal_separator == "," else ","
+        cleaned = cleaned.replace(thousands_separator, "")
+        if decimal_separator == ",":
+            cleaned = cleaned.replace(",", ".")
+    elif comma >= 0:
+        decimals = len(cleaned) - comma - 1
+        cleaned = cleaned.replace(",", "." if decimals == 2 else "")
+    elif point >= 0:
+        decimals = len(cleaned) - point - 1
+        if decimals != 2:
+            cleaned = cleaned.replace(".", "")
+
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def parse_dates(series, *, dayfirst=False):
+    """Parse a column that may contain ISO, written-month, or numeric dates."""
+    return pd.to_datetime(series, format="mixed", dayfirst=dayfirst, errors="coerce")
+
 def clean_csv_files(netsuite_path, salesforce_path, stripe_path, 
                     output1_path, output2_path, output3_path):
     """
@@ -21,13 +62,13 @@ def clean_csv_files(netsuite_path, salesforce_path, stripe_path,
 
     for col in ["Customer_ID", "Stripe_ID"]:
         if col in df1.columns:
-            df1[col] = df1[col].astype(str).str.strip()
+            df1[col] = normalize_id(df1[col])
     if "Customer_ID" in df3.columns:
-        df3["Customer_ID"] = df3["Customer_ID"].astype(str).str.strip()
+        df3["Customer_ID"] = normalize_id(df3["Customer_ID"])
     if "Stripe_ID" in df2.columns:
-        df2["Stripe_ID"] = df2["Stripe_ID"].astype(str).str.strip()
+        df2["Stripe_ID"] = normalize_id(df2["Stripe_ID"])
     if "Account_ID" in df2.columns:
-        df2["Account_ID"] = df2["Account_ID"].astype(str).str.strip()
+        df2["Account_ID"] = normalize_id(df2["Account_ID"])
 
     cleaning_report = {
         "netsuite": {"rows_before": len(df1)},
@@ -36,30 +77,43 @@ def clean_csv_files(netsuite_path, salesforce_path, stripe_path,
     }
 
     # === Clean NetSuite ===
+    before_dedup = len(df1)
     df1.drop_duplicates(inplace=True)
-    df1["Date"] = pd.to_datetime(df1["Date"], errors="coerce")
+    duplicates_removed = before_dedup - len(df1)
+    df1["Date"] = parse_dates(df1["Date"], dayfirst=True)
+    invalid_dates = int(df1["Date"].isna().sum())
     df1.dropna(subset=["Date"], inplace=True)
-    df1["Revenue"] = df1["Revenue"].astype(str).str.replace(r"[^\d\.]", "", regex=True)
-    df1["Revenue"] = pd.to_numeric(df1["Revenue"], errors="coerce")
+    df1["Revenue"] = df1["Revenue"].apply(parse_mixed_amount)
+    invalid_revenue_rows = int(df1["Revenue"].isna().sum())
     df1.dropna(subset=["Revenue"], inplace=True)
-    df1 = df1[df1["Revenue"].between(0, 1_000_000)]  # outlier check
+    in_range = df1["Revenue"].between(0, 1_000_000)
+    revenue_outliers = int((~in_range).sum())
+    df1 = df1[in_range]
 
     # Standardize names
     df1["Customer_Name"] = df1["Customer_Name"].str.strip().str.title()
 
     cleaning_report["netsuite"].update({
-        "duplicates_removed": len(df1),
-        "invalid_dates": df1["Date"].isna().sum(),
-        "invalid_revenue_rows": df1["Revenue"].isna().sum(),
-        "missing_stripe_id": df1["Stripe_ID"].isna().sum(),
+        "duplicates_removed": duplicates_removed,
+        "invalid_dates_removed": invalid_dates,
+        "invalid_revenue_rows_removed": invalid_revenue_rows,
+        "revenue_outliers_removed": revenue_outliers,
+        "missing_stripe_id": int(df1["Stripe_ID"].isna().sum()),
         "rows_after": len(df1)
     })
 
     # === Clean Salesforce ===
+    before_dedup = len(df2)
     df2.drop_duplicates(inplace=True)
-    df2["Closed_Contract_Date"] = pd.to_datetime(df2["Closed_Contract_Date"], errors="coerce")
+    duplicates_removed = before_dedup - len(df2)
+    df2["Closed_Contract_Date"] = parse_dates(df2["Closed_Contract_Date"])
+    invalid_dates = int(df2["Closed_Contract_Date"].isna().sum())
     df2.dropna(subset=["Closed_Contract_Date"], inplace=True)
-    df2["Phone_Number"] = df2["Phone_Number"].astype(str).apply(lambda x: re.sub(r"\D+", "", x))
+    original_phone = df2["Phone_Number"].astype("string")
+    df2["Phone_Number"] = original_phone.apply(
+        lambda x: re.sub(r"\D+", "", x) if pd.notna(x) else pd.NA
+    )
+    phone_numbers_changed = int((original_phone != df2["Phone_Number"]).fillna(False).sum())
 
     def is_valid_email(val):
         pattern = r"^[A-Za-z0-9\._%+\-]+@[A-Za-z0-9\.-]+\.[A-Za-z]{2,}$"
@@ -72,29 +126,35 @@ def clean_csv_files(netsuite_path, salesforce_path, stripe_path,
     df2["Account_Name"] = df2["Account_Name"].str.strip().str.title()
 
     cleaning_report["salesforce"].update({
-        "duplicates_removed": len(df2),
-        "invalid_dates": df2["Closed_Contract_Date"].isna().sum(),
-        "phone_numbers_fixed": sum(~df2["Phone_Number"].str.match(r"^\d+$")),
-        "invalid_emails": (~valid_emails).sum(),
+        "duplicates_removed": duplicates_removed,
+        "invalid_dates_removed": invalid_dates,
+        "phone_numbers_standardized": phone_numbers_changed,
+        "invalid_emails": int((~valid_emails).sum()),
         "rows_after": len(df2)
     })
 
     # === Clean Stripe ===
+    before_dedup = len(df3)
     df3.drop_duplicates(inplace=True)
-    df3["Date"] = pd.to_datetime(df3["Date"], errors="coerce")
+    duplicates_removed = before_dedup - len(df3)
+    df3["Date"] = parse_dates(df3["Date"], dayfirst=True)
+    invalid_dates = int(df3["Date"].isna().sum())
     df3.dropna(subset=["Date"], inplace=True)
-    df3["Amount"] = df3["Amount"].astype(str).str.replace(r"[^\d\.]", "", regex=True)
-    df3["Amount"] = pd.to_numeric(df3["Amount"], errors="coerce")
+    df3["Amount"] = df3["Amount"].apply(parse_mixed_amount)
+    invalid_amounts = int(df3["Amount"].isna().sum())
     df3.dropna(subset=["Amount"], inplace=True)
-    df3 = df3[df3["Amount"].between(0, 1_000_000)]  # outlier check
+    in_range = df3["Amount"].between(0, 1_000_000)
+    amount_outliers = int((~in_range).sum())
+    df3 = df3[in_range]
 
     # Standardize names
     df3["Customer_Name"] = df3["Customer_Name"].str.strip().str.title()
 
     cleaning_report["stripe"].update({
-        "duplicates_removed": len(df3),
-        "invalid_dates": df3["Date"].isna().sum(),
-        "invalid_amounts": df3["Amount"].isna().sum(),
+        "duplicates_removed": duplicates_removed,
+        "invalid_dates_removed": invalid_dates,
+        "invalid_amounts_removed": invalid_amounts,
+        "amount_outliers_removed": amount_outliers,
         "rows_after": len(df3)
     })
 
